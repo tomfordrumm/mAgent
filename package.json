@@ -1,0 +1,15 @@
+{
+  "name": "simple-js-coding-agent",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "my-agent": "./agent.js"
+  },
+  "scripts": {
+    "start": "node agent.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2"
+  }
+}
