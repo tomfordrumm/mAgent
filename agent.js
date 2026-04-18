@@ -6,20 +6,89 @@ import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { fileURLToPath } from "node:url";
 
+// -----------------------------------------------------------------------------
+// App configuration
+// -----------------------------------------------------------------------------
+
 const API_URL = "https://api.openai.com/v1/responses";
+const PROJECT_ROOT = process.cwd();
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
-const ROOT_DIR = process.cwd();
 const SPINNER_FRAMES = ["|", "/", "-", "\\"];
 
 const SYSTEM_PROMPT = [
   "You are a simple coding agent working inside a local codebase.",
-  `The project root is: ${ROOT_DIR}`,
+  `The project root is: ${PROJECT_ROOT}`,
   "Use tools when you need to inspect or modify the codebase.",
   "Be careful with writes. Only change files that are necessary.",
   "Keep answers concise and practical."
 ].join("\n");
 
-const tools = [
+function getModelName() {
+  return process.env.OPENAI_MODEL || "gpt-5.2";
+}
+
+function loadEnvironment() {
+  const scriptEnvFile = path.join(SCRIPT_DIR, ".env");
+  const rootEnvFile = path.join(PROJECT_ROOT, ".env");
+
+  dotenv.config({ path: scriptEnvFile, quiet: true });
+
+  if (SCRIPT_DIR !== PROJECT_ROOT) {
+    dotenv.config({ path: rootEnvFile, override: false, quiet: true });
+  }
+
+  if (!process.env.OPENAI_API_KEY) {
+    const checkedFiles =
+      SCRIPT_DIR === PROJECT_ROOT
+        ? scriptEnvFile
+        : `${scriptEnvFile} and ${rootEnvFile}`;
+
+    throw new Error(`Missing OPENAI_API_KEY. Checked ${checkedFiles}`);
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Local file tools
+// -----------------------------------------------------------------------------
+
+function resolveProjectPath(relativePath) {
+  const absolutePath = path.resolve(PROJECT_ROOT, relativePath);
+  const pathFromRoot = path.relative(PROJECT_ROOT, absolutePath);
+
+  if (pathFromRoot.startsWith("..") || path.isAbsolute(pathFromRoot)) {
+    throw new Error("Path must stay inside the project root.");
+  }
+
+  return absolutePath;
+}
+
+async function listDirectory(relativeDir) {
+  const directoryPath = resolveProjectPath(relativeDir);
+  const entries = await fs.readdir(directoryPath, { withFileTypes: true });
+
+  const simplifiedEntries = entries
+    .map((entry) => ({
+      name: entry.name,
+      type: entry.isDirectory() ? "directory" : "file"
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  return JSON.stringify(simplifiedEntries, null, 2);
+}
+
+async function readProjectFile(relativeFile) {
+  const filePath = resolveProjectPath(relativeFile);
+  return fs.readFile(filePath, "utf8");
+}
+
+async function writeProjectFile(relativeFile, content) {
+  const filePath = resolveProjectPath(relativeFile);
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, content, "utf8");
+  return `Wrote ${content.length} characters to ${relativeFile}`;
+}
+
+const TOOL_DEFINITIONS = [
   {
     type: "function",
     name: "read_directory",
@@ -74,54 +143,39 @@ const tools = [
   }
 ];
 
-function getModel() {
-  return process.env.OPENAI_MODEL || "gpt-5.2";
+const TOOL_HANDLERS = {
+  read_directory: async ({ dir }) => listDirectory(dir),
+  read_file: async ({ file }) => readProjectFile(file),
+  write_file: async ({ file, content }) => writeProjectFile(file, content)
+};
+
+function getToolTarget(toolName, toolArgs) {
+  if (toolName === "read_directory") {
+    return toolArgs.dir || ".";
+  }
+
+  if (toolName === "read_file" || toolName === "write_file") {
+    return toolArgs.file || "";
+  }
+
+  return "";
 }
 
-function resolvePath(relativePath) {
-  const fullPath = path.resolve(ROOT_DIR, relativePath);
-  const relative = path.relative(ROOT_DIR, fullPath);
+async function executeTool(toolName, toolArgs) {
+  const handler = TOOL_HANDLERS[toolName];
 
-  if (relative.startsWith("..") || path.isAbsolute(relative)) {
-    throw new Error("Path must stay inside the project root.");
+  if (!handler) {
+    throw new Error(`Unknown tool: ${toolName}`);
   }
 
-  return fullPath;
+  return handler(toolArgs);
 }
 
-async function runTool(name, args) {
-  if (name === "read_directory") {
-    const dirPath = resolvePath(args.dir);
-    const entries = await fs.readdir(dirPath, { withFileTypes: true });
-    return JSON.stringify(
-      entries
-        .map((entry) => ({
-          name: entry.name,
-          type: entry.isDirectory() ? "directory" : "file"
-        }))
-        .sort((a, b) => a.name.localeCompare(b.name)),
-      null,
-      2
-    );
-  }
+// -----------------------------------------------------------------------------
+// OpenAI API helpers
+// -----------------------------------------------------------------------------
 
-  if (name === "read_file") {
-    const filePath = resolvePath(args.file);
-    const content = await fs.readFile(filePath, "utf8");
-    return content;
-  }
-
-  if (name === "write_file") {
-    const filePath = resolvePath(args.file);
-    await fs.mkdir(path.dirname(filePath), { recursive: true });
-    await fs.writeFile(filePath, args.content, "utf8");
-    return `Wrote ${args.content.length} characters to ${args.file}`;
-  }
-
-  throw new Error(`Unknown tool: ${name}`);
-}
-
-async function createResponse(payload) {
+async function createModelResponse(payload) {
   const response = await fetch(API_URL, {
     method: "POST",
     headers: {
@@ -139,8 +193,70 @@ async function createResponse(payload) {
   return response.json();
 }
 
-function startThinking(message = "Thinking") {
+function buildInitialRequest(userMessage, previousResponseId) {
+  return {
+    model: getModelName(),
+    instructions: SYSTEM_PROMPT,
+    tools: TOOL_DEFINITIONS,
+    input: userMessage,
+    previous_response_id: previousResponseId
+  };
+}
+
+function buildToolFollowUp(toolOutputs, previousResponseId) {
+  return {
+    model: getModelName(),
+    instructions: SYSTEM_PROMPT,
+    tools: TOOL_DEFINITIONS,
+    input: toolOutputs,
+    previous_response_id: previousResponseId
+  };
+}
+
+// -----------------------------------------------------------------------------
+// Response parsing
+// -----------------------------------------------------------------------------
+
+function getFunctionCalls(response) {
+  return (response.output || []).filter((item) => item.type === "function_call");
+}
+
+function getAssistantText(response) {
+  const textChunks = [];
+
+  for (const outputItem of response.output || []) {
+    if (outputItem.type !== "message" || !Array.isArray(outputItem.content)) {
+      continue;
+    }
+
+    for (const contentItem of outputItem.content) {
+      if (contentItem.type === "output_text" && typeof contentItem.text === "string") {
+        textChunks.push(contentItem.text);
+      }
+    }
+  }
+
+  return textChunks.join("\n").trim();
+}
+
+function formatToolPreview(toolOutput) {
+  if (typeof toolOutput !== "string") {
+    return "";
+  }
+
+  const singleLinePreview = toolOutput.replace(/\s+/g, " ").trim();
+  return singleLinePreview.length > 120
+    ? `${singleLinePreview.slice(0, 117)}...`
+    : singleLinePreview;
+}
+
+// -----------------------------------------------------------------------------
+// Terminal helpers
+// -----------------------------------------------------------------------------
+
+function createSpinner(message = "Thinking") {
   let frameIndex = 0;
+
   process.stdout.write(`\n${message} ${SPINNER_FRAMES[frameIndex]}`);
 
   const timer = setInterval(() => {
@@ -151,78 +267,30 @@ function startThinking(message = "Thinking") {
   return {
     stop(finalMessage = "Done") {
       clearInterval(timer);
-      process.stdout.write(`\r${finalMessage}${" ".repeat(Math.max(message.length - finalMessage.length + 2, 2))}\n`);
+
+      const padding = " ".repeat(Math.max(message.length - finalMessage.length + 2, 2));
+      process.stdout.write(`\r${finalMessage}${padding}\n`);
     }
   };
 }
 
-function getToolTarget(name, args) {
-  if (name === "read_directory") {
-    return args.dir || ".";
-  }
-
-  if (name === "read_file" || name === "write_file") {
-    return args.file || "";
-  }
-
-  return "";
-}
-
-function formatToolPreview(text) {
-  if (typeof text !== "string") {
-    return "";
-  }
-
-  const singleLine = text.replace(/\s+/g, " ").trim();
-  return singleLine.length > 120 ? `${singleLine.slice(0, 117)}...` : singleLine;
-}
-
-function getFunctionCalls(response) {
-  return (response.output || []).filter((item) => item.type === "function_call");
-}
-
-function getTextFromResponse(response) {
-  const chunks = [];
-
-  for (const item of response.output || []) {
-    if (item.type !== "message" || !Array.isArray(item.content)) {
-      continue;
-    }
-
-    for (const content of item.content) {
-      if (content.type === "output_text" && typeof content.text === "string") {
-        chunks.push(content.text);
-      }
-    }
-  }
-
-  return chunks.join("\n").trim();
-}
-
-function exitGracefully() {
+function handleExitSignal() {
   console.log("\ngoodbye");
   process.exit(0);
 }
 
-async function runAgentTurn(userInput, previousResponseId) {
-  const model = getModel();
-  let spinner = startThinking();
-  let response;
+function printBanner() {
+  console.log("Simple coding agent");
+  console.log(`Model: ${getModelName()}`);
+  console.log(`Root: ${PROJECT_ROOT}`);
+  console.log("Type 'exit' to quit.\n");
+}
 
-  try {
-    response = await createResponse({
-      model,
-      instructions: SYSTEM_PROMPT,
-      tools,
-      input: userInput,
-      previous_response_id: previousResponseId
-    });
-    spinner.stop("Thought");
-  } catch (error) {
-    spinner.stop("Failed");
-    throw error;
-  }
+// -----------------------------------------------------------------------------
+// Agent loop
+// -----------------------------------------------------------------------------
 
+async function runToolCallsUntilDone(response) {
   while (true) {
     const functionCalls = getFunctionCalls(response);
 
@@ -233,40 +301,37 @@ async function runAgentTurn(userInput, previousResponseId) {
     const toolOutputs = [];
 
     for (const call of functionCalls) {
-      let outputText;
-      let args = {};
+      let toolArgs = {};
+      let toolOutput;
 
       try {
-        args = JSON.parse(call.arguments || "{}");
-        const target = getToolTarget(call.name, args);
-        console.log(target ? `[tool] ${call.name} ${target}` : `[tool] ${call.name}`);
-        outputText = await runTool(call.name, args);
-        const preview = formatToolPreview(outputText);
+        toolArgs = JSON.parse(call.arguments || "{}");
+        const toolTarget = getToolTarget(call.name, toolArgs);
+        console.log(toolTarget ? `[tool] ${call.name} ${toolTarget}` : `[tool] ${call.name}`);
+
+        toolOutput = await executeTool(call.name, toolArgs);
+
+        const preview = formatToolPreview(toolOutput);
         console.log(preview ? `[tool] ok ${preview}` : "[tool] ok");
       } catch (error) {
-        const target = getToolTarget(call.name, args);
-        console.log(target ? `[tool] ${call.name} ${target}` : `[tool] ${call.name}`);
-        outputText = `Tool error: ${error.message}`;
+        const toolTarget = getToolTarget(call.name, toolArgs);
+        console.log(toolTarget ? `[tool] ${call.name} ${toolTarget}` : `[tool] ${call.name}`);
+
+        toolOutput = `Tool error: ${error.message}`;
         console.log(`[tool] error ${error.message}`);
       }
 
       toolOutputs.push({
         type: "function_call_output",
         call_id: call.call_id,
-        output: outputText
+        output: toolOutput
       });
     }
 
-    spinner = startThinking();
+    const spinner = createSpinner();
 
     try {
-      response = await createResponse({
-        model,
-        instructions: SYSTEM_PROMPT,
-        tools,
-        input: toolOutputs,
-        previous_response_id: response.id
-      });
+      response = await createModelResponse(buildToolFollowUp(toolOutputs, response.id));
       spinner.stop("Thought");
     } catch (error) {
       spinner.stop("Failed");
@@ -275,56 +340,65 @@ async function runAgentTurn(userInput, previousResponseId) {
   }
 }
 
-async function main() {
-  process.on("SIGINT", exitGracefully);
+async function runAgentTurn(userMessage, previousResponseId) {
+  const spinner = createSpinner();
+  let response;
 
-  dotenv.config({ path: path.join(SCRIPT_DIR, ".env"), quiet: true });
-
-  if (SCRIPT_DIR !== ROOT_DIR) {
-    dotenv.config({ path: path.join(ROOT_DIR, ".env"), override: false, quiet: true });
+  try {
+    response = await createModelResponse(buildInitialRequest(userMessage, previousResponseId));
+    spinner.stop("Thought");
+  } catch (error) {
+    spinner.stop("Failed");
+    throw error;
   }
 
-  if (!process.env.OPENAI_API_KEY) {
-    console.error(
-      `Missing OPENAI_API_KEY. Checked ${path.join(SCRIPT_DIR, ".env")}` +
-        (SCRIPT_DIR !== ROOT_DIR ? ` and ${path.join(ROOT_DIR, ".env")}` : "")
-    );
-    process.exit(1);
-  }
+  return runToolCallsUntilDone(response);
+}
 
-  const rl = readline.createInterface({ input, output });
-  const model = getModel();
+// -----------------------------------------------------------------------------
+// CLI
+// -----------------------------------------------------------------------------
+
+async function startCli() {
+  const terminal = readline.createInterface({ input, output });
   let previousResponseId;
 
-  console.log(`Simple coding agent`);
-  console.log(`Model: ${model}`);
-  console.log(`Root: ${ROOT_DIR}`);
-  console.log(`Type 'exit' to quit.\n`);
+  printBanner();
 
   try {
     while (true) {
-      const userInput = (await rl.question("> ")).trim();
+      const userMessage = (await terminal.question("> ")).trim();
 
-      if (!userInput) {
+      if (!userMessage) {
         continue;
       }
 
-      if (userInput.toLowerCase() === "exit") {
+      if (userMessage.toLowerCase() === "exit") {
         break;
       }
 
       try {
-        const response = await runAgentTurn(userInput, previousResponseId);
+        const response = await runAgentTurn(userMessage, previousResponseId);
         previousResponseId = response.id;
-        const text = getTextFromResponse(response);
-        console.log(`\n${text || "(no text response)"}\n`);
+
+        const assistantText = getAssistantText(response);
+        console.log(`\n${assistantText || "(no text response)"}\n`);
       } catch (error) {
         console.error(`\nError: ${error.message}\n`);
       }
     }
   } finally {
-    rl.close();
+    terminal.close();
   }
 }
 
-main();
+async function main() {
+  process.on("SIGINT", handleExitSignal);
+  loadEnvironment();
+  await startCli();
+}
+
+main().catch((error) => {
+  console.error(`Error: ${error.message}`);
+  process.exit(1);
+});
