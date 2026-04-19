@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 import dotenv from "dotenv";
+import { exec as execCallback } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
+import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 
 // -----------------------------------------------------------------------------
@@ -11,9 +13,11 @@ import { fileURLToPath } from "node:url";
 // -----------------------------------------------------------------------------
 
 const API_URL = "https://api.openai.com/v1/responses";
+const exec = promisify(execCallback);
 const PROJECT_ROOT = process.cwd();
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const SPINNER_FRAMES = ["|", "/", "-", "\\"];
+const MAX_BASH_OUTPUT_LENGTH = 8_000;
 
 const SYSTEM_PROMPT = [
   "You are a simple coding agent working inside a local codebase.",
@@ -88,6 +92,50 @@ async function writeProjectFile(relativeFile, content) {
   return `Wrote ${content.length} characters to ${relativeFile}`;
 }
 
+function truncateText(text, maxLength = MAX_BASH_OUTPUT_LENGTH) {
+  if (typeof text !== "string" || text.length <= maxLength) {
+    return text;
+  }
+
+  return `${text.slice(0, maxLength)}\n...output truncated...`;
+}
+
+async function runBashCommand(command) {
+  try {
+    const { stdout, stderr } = await exec(command, {
+      cwd: PROJECT_ROOT,
+      timeout: 15_000,
+      maxBuffer: 1024 * 1024,
+      shell: "/bin/bash"
+    });
+
+    return JSON.stringify(
+      {
+        ok: true,
+        command,
+        cwd: PROJECT_ROOT,
+        stdout: truncateText(stdout),
+        stderr: truncateText(stderr)
+      },
+      null,
+      2
+    );
+  } catch (error) {
+    return JSON.stringify(
+      {
+        ok: false,
+        command,
+        cwd: PROJECT_ROOT,
+        stdout: truncateText(error.stdout || ""),
+        stderr: truncateText(error.stderr || error.message),
+        exitCode: error.code ?? null
+      },
+      null,
+      2
+    );
+  }
+}
+
 const TOOL_DEFINITIONS = [
   {
     type: "function",
@@ -140,13 +188,30 @@ const TOOL_DEFINITIONS = [
       required: ["file", "content"],
       additionalProperties: false
     }
+  },
+  {
+    type: "function",
+    name: "run_bash",
+    description: "Run a bash command in the project root and return stdout, stderr, and exit status.",
+    parameters: {
+      type: "object",
+      properties: {
+        command: {
+          type: "string",
+          description: "Bash command to run inside the project root."
+        }
+      },
+      required: ["command"],
+      additionalProperties: false
+    }
   }
 ];
 
 const TOOL_HANDLERS = {
   read_directory: async ({ dir }) => listDirectory(dir),
   read_file: async ({ file }) => readProjectFile(file),
-  write_file: async ({ file, content }) => writeProjectFile(file, content)
+  write_file: async ({ file, content }) => writeProjectFile(file, content),
+  run_bash: async ({ command }) => runBashCommand(command)
 };
 
 function getToolTarget(toolName, toolArgs) {
@@ -156,6 +221,10 @@ function getToolTarget(toolName, toolArgs) {
 
   if (toolName === "read_file" || toolName === "write_file") {
     return toolArgs.file || "";
+  }
+
+  if (toolName === "run_bash") {
+    return toolArgs.command || "";
   }
 
   return "";
